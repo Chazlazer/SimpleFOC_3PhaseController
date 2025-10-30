@@ -6,6 +6,7 @@
 #include "StateMachine.h"
 #include "hw_configs.h"
 #include "user_configs.h"
+#include "SimpleCAN.h"
 
 #define VERSION_NUM 1.0f
 
@@ -24,6 +25,21 @@ MagneticSensorI2C sensor = MagneticSensorI2C(AS5600_I2C);
 // User Interface State Machine
 StateMachine state_machine(SystemState::MENU_MODE);
 MotorConfig cfg;
+
+
+// CANBUS
+// pass in optional shutdown and terminator pins that disable transceiver and add 120ohm resistor respectively
+SimpleCan can1(A_CAN_SHDN,A_CAN_TERM);
+static void init_CAN();
+static void handleCanMessage(FDCAN_RxHeaderTypeDef rxHeader, uint8_t *rxData);
+float uint_to_float(int x_int, float x_min, float x_max, int bits);
+SimpleCan::RxHandler can1RxHandler(8, handleCanMessage);
+float commands[5];
+volatile bool can_special_msg1 = false;
+volatile bool can_special_msg2 = false;
+volatile bool can_new_msg = false;
+uint8_t last_can_data[8];
+
 
 bool align_motor_flag = false;
 
@@ -62,6 +78,8 @@ void setup() {
     // #ifdef DHAL_CORDIC_MODULE_ENABLED
     SimpleFOC_CORDIC_Config();
     // #endif
+
+    // Setup CAN
 
     // use monitoring with serial 
     Serial.begin(115200);
@@ -116,7 +134,8 @@ void setup() {
       }
       store_inital_value = false;
     }
-
+    
+    init_CAN();
     Serial.print("Version: ");
     Serial.println(VERSION_NUM);
     state_machine.print_menu();
@@ -127,6 +146,42 @@ void loop() {
         read_serial();
     }
 
+    if (can_special_msg1 && (state_machine.getState() != SystemState::MOTOR_MODE)) {
+        can_special_msg1 = false;
+        state_machine.setState(SystemState::MOTOR_MODE);  
+        // Serial.println("Special message 1 received!");
+        // e.g. stop motor
+    }
+
+    if (can_special_msg2 && (state_machine.getState() != SystemState::MENU_MODE)) {
+        can_special_msg2 = false;
+        state_machine.setState(SystemState::MENU_MODE);  
+        // Serial.println("Special message 2 received!");
+        // e.g. recalibrate or change mode
+    }
+    if (can_new_msg) {
+        noInterrupts();
+        uint8_t data_copy[8];
+        memcpy(data_copy, last_can_data, 8);
+        can_new_msg = false;
+        interrupts();
+
+        // Now unpack safely outside ISR
+        int p_int  = (data_copy[0] << 8) | data_copy[1];
+        int v_int  = (data_copy[2] << 4) | (data_copy[3] >> 4);
+        int kp_int = ((data_copy[3] & 0xF) << 8) | data_copy[4];
+        int kd_int = (data_copy[5] << 4) | (data_copy[6] >> 4);
+        int t_int  = ((data_copy[6] & 0xF) << 8) | data_copy[7];
+
+        commands[0] = uint_to_float(p_int,  -cfg.P_MAX,  cfg.P_MAX, 16);
+        commands[1] = uint_to_float(v_int,  -cfg.V_MAX,  cfg.V_MAX, 12);
+        commands[2] = uint_to_float(kp_int, -cfg.KP_MAX, cfg.KP_MAX, 12);
+        commands[3] = uint_to_float(kd_int, -cfg.KD_MAX, cfg.KD_MAX, 12);
+        commands[4] = uint_to_float(t_int,  -cfg.I_MAX*cfg.KT*cfg.GR, cfg.I_MAX*cfg.KT*cfg.GR, 12);
+
+        // Serial.print("Target Set to: ");
+        // Serial.println(commands[0]);
+    }
     // --- State-specific behavior ---
     switch (state_machine.currentState) {
       case SystemState::MENU_MODE:
@@ -229,7 +284,7 @@ void setup_simplefoc(){
     // angle P controller
     motor.P_angle.P = 20;
     //  maximal velocity of the position control
-    motor.velocity_limit = 4;
+    motor.velocity_limit = 20;
 
    // comment out if not needed
     motor.useMonitoring(Serial);
@@ -345,6 +400,12 @@ void motor_mode(){
   if(cfg.MOTOR_MODE == MotionControlType::velocity){
   }
   else if(cfg.MOTOR_MODE == MotionControlType::angle){
+    target_angle = commands[0];
+    motor.loopFOC();
+    motor.move(target_angle);
+    // Serial.print("Target Set to: ");
+    // Serial.println(target_position);
+
   }
 }
 
@@ -403,4 +464,60 @@ void read_vbus(){
     Serial.println(" V");
 
     Serial.println("-------------------------");
+}
+
+
+static void init_CAN()
+{
+	Serial.println(can1.init(CanSpeed::Mbit1) == HAL_OK
+					   ? "CAN: initialized."
+					   : "CAN: error when initializing.");
+
+	FDCAN_FilterTypeDef sFilterConfig;
+
+	// Configure Rx filter
+	sFilterConfig.IdType = FDCAN_STANDARD_ID;
+	sFilterConfig.FilterIndex = 0;
+	sFilterConfig.FilterType = FDCAN_FILTER_MASK;
+	sFilterConfig.FilterConfig = FDCAN_FILTER_TO_RXFIFO0;
+	sFilterConfig.FilterID1 = cfg.CAN_ID;
+	sFilterConfig.FilterID2 = 0x7FF;
+
+	can1.configFilter(&sFilterConfig);
+	can1.configGlobalFilter(FDCAN_REJECT, FDCAN_REJECT, FDCAN_FILTER_REMOTE, FDCAN_FILTER_REMOTE);
+	can1.activateNotification(&can1RxHandler);
+
+	Serial.println(can1.start() == HAL_OK
+					   ? "CAN: started."
+					   : "CAN: error when starting.");
+}
+
+static void handleCanMessage(FDCAN_RxHeaderTypeDef rxHeader, uint8_t *rxData)
+{
+    // Copy message quickly
+    for (int i = 0; i < 8; i++) {
+        last_can_data[i] = rxData[i];
+    }
+
+    // Convert to 64-bit word for fast compare
+    uint64_t msg64;
+    memcpy(&msg64, rxData, 8);
+
+    // Compare both patterns
+    if (msg64 == 0xFCFFFFFFFFFFFFFFULL) {
+        can_special_msg1 = true;
+    }
+    else if (msg64 == 0xFDFFFFFFFFFFFFFFULL) {
+        can_special_msg2 = true;
+    }
+    else {
+        can_new_msg = true;
+    }
+}
+
+float uint_to_float(int x_int, float x_min, float x_max, int bits){
+    /// converts unsigned int to float, given range and number of bits ///
+    float span = x_max - x_min;
+    float offset = x_min;
+    return ((float)x_int)*span/((float)((1<<bits)-1)) + offset;
 }
